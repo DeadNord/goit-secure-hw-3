@@ -1,0 +1,16 @@
+rules:
+  - id: fastapi-endpoint-must-have-response-model
+    message: "FastAPI endpoint має мати response_model (сигнал контракту)"
+    severity: ERROR
+    languages: [python]
+    patterns:
+      - pattern: |
+          @app.$M(...)
+          def $F(...):
+            ...
+      - pattern-not: |
+          @app.$M(..., response_model=$X, ...)
+          def $F(...):
+            ...
+    metadata:
+      category: security

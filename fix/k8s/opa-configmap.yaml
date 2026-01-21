@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-api-opa-policy
+  labels:
+    app: user-api
+data:
+  httpapi.rego: |
+    package httpapi
+
+    default allow = false
+
+    allow {
+      input.path == "/health"
+      input.method == "GET"
+    }
+
+    allow {
+      input.path == "/login"
+      input.method == "POST"
+    }
+
+    allow {
+      input.path == "/user"
+      input.method == "GET"
+      input.subject != "anonymous"
+      "user:read" in input.scopes
+    }

@@ -1,0 +1,156 @@
+name: CI
+on: [push, pull_request]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  IMAGE_NAME: user-api
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: "3.10"
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --- secrets scanning ---
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+      # --- SAST (semgrep) ---
+      - name: Semgrep (SAST)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: .semgrep.yml
+
+      # --- OpenAPI як артефакт + контроль змін контракту (diff) ---
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Export OpenAPI
+        run: |
+          python scripts/export_openapi.py > openapi.generated.json
+
+      - name: Validate OpenAPI is tracked (contract must be visible)
+        run: |
+          diff -u openapi.json openapi.generated.json
+
+      # --- Policy-as-Code: K8s manifests ---
+      - name: Conftest (K8s policies)
+        uses: instrumenta/conftest-action@v0.4.0
+        with:
+          files: |
+            deployment.yaml
+            k8s/secretproviderclass.yaml
+          policy: opa/k8s
+
+      # --- IaC: terraform validate + plan + OPA policy on plan ---
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Terraform fmt/validate/plan (no backend)
+        working-directory: terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false
+          terraform validate
+          terraform plan -out=tfplan
+          terraform show -json tfplan > tfplan.json
+
+      - name: Conftest (Terraform plan policies)
+        uses: instrumenta/conftest-action@v0.4.0
+        with:
+          files: terraform/tfplan.json
+          policy: opa/terraform
+
+      # --- OPA unit tests (policy correctness) ---
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: 0.66.0
+
+      - name: OPA test
+        run: opa test opa -v
+
+  build_scan_sbom_sign:
+    needs: [gates]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set image ref
+        id: vars
+        run: |
+          OWNER="${{ github.repository_owner }}"
+          REPO="${{ github.event.repository.name }}"
+          echo "IMAGE=${{ env.REGISTRY }}/${OWNER}/${REPO}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          docker build -t "${{ steps.vars.outputs.IMAGE }}" .
+
+      # --- CVE gate (trivy) ---
+      - name: Trivy image scan (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: "${{ steps.vars.outputs.IMAGE }}"
+          format: "table"
+          exit-code: "1"
+          severity: "CRITICAL,HIGH"
+
+      # --- SBOM (syft) ---
+      - name: Generate SBOM (SPDX-JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          image: "${{ steps.vars.outputs.IMAGE }}"
+          format: "spdx-json"
+          output-file: "sbom.spdx.json"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      - name: Push image
+        run: |
+          docker push "${{ steps.vars.outputs.IMAGE }}"
+
+      # --- Cosign: підпис + attestation SBOM (keyless через OIDC) ---
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: |
+          cosign sign --yes "${{ steps.vars.outputs.IMAGE }}"
+
+      - name: Attest SBOM (SPDX-JSON)
+        run: |
+          cosign attest --yes \
+            --type spdxjson \
+            --predicate sbom.spdx.json \
+            "${{ steps.vars.outputs.IMAGE }}"
